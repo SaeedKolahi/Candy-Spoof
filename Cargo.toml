@@ -44,6 +44,9 @@ rand = "0.8"
 # Byte manipulation
 bytes = "1"
 
+# Concurrent maps
+dashmap = "6"
+
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
 

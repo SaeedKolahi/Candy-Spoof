@@ -92,23 +92,19 @@ impl RawSender {
         let fd = create_raw_send_socket()?;
         let (tx, mut rx) = mpsc::channel::<OutPacket>(4096);
 
-        // Background tokio task that drives the blocking socket from an
-        // async channel.  We use `spawn_blocking` so as not to block the
-        // async scheduler.
-        tokio::spawn(async move {
-            while let Some(out) = rx.recv().await {
-                // fd is RawFd (i32, Copy) – captured by the outer move closure
-                // and again by the inner move closure.
-                let _ = tokio::task::spawn_blocking(move || {
+        // Dedicated blocking sender thread. This avoids expensive per-packet
+        // spawn_blocking scheduling overhead under high packet rates.
+        std::thread::Builder::new()
+            .name("raw-send".into())
+            .spawn(move || {
+                while let Some(out) = rx.blocking_recv() {
                     if let Err(e) = send_out_packet(fd, out) {
                         log::warn!("raw-send error: {}", e);
                     }
-                })
-                .await;
-            }
-            // Close the socket when the channel is dropped.
-            unsafe { libc::close(fd) };
-        });
+                }
+                unsafe { libc::close(fd) };
+            })
+            .context("spawn raw send thread")?;
 
         Ok(Self { tx })
     }
