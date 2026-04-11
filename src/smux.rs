@@ -127,7 +127,32 @@ async fn send_on_lane(
     lanes: &Mutex<Vec<Lane>>,
     rr: &AtomicUsize,
     payload: Bytes,
+    lane_hint: Option<u32>,
 ) -> Result<()> {
+    if let Some(tunnel_id) = lane_hint {
+        let lane = {
+            let lanes_guard = lanes.lock().await;
+            lanes_guard
+                .iter()
+                .find(|l| l.tunnel_id == tunnel_id)
+                .cloned()
+        };
+
+        if let Some(lane) = lane {
+            if lane.tx.send(payload).await.is_ok() {
+                return Ok(());
+            }
+
+            let mut lanes_guard = lanes.lock().await;
+            if let Some(pos) = lanes_guard.iter().position(|l| l.tunnel_id == tunnel_id) {
+                lanes_guard.remove(pos);
+            }
+            return Err(anyhow!("tunnel lane {} unavailable", tunnel_id));
+        }
+
+        return Err(anyhow!("tunnel lane {} not found", tunnel_id));
+    }
+
     for _ in 0..8 {
         let lane = {
             let lanes_guard = lanes.lock().await;
@@ -153,6 +178,7 @@ async fn send_on_lane(
 
 struct ClientStream {
     app_tx: mpsc::Sender<Bytes>,
+    lane_tunnel_id: u32,
 }
 
 struct ClientInner {
@@ -192,7 +218,20 @@ impl SmuxClient {
         tokio::spawn(async move {
             while let Some(frame) = outgoing_rx.recv().await {
                 let payload = frame.encode();
-                if let Err(e) = send_on_lane(&send_state.inner.lanes, &send_state.inner.rr, payload).await {
+                let lane_hint = if frame.stream_id == 0 {
+                    None
+                } else {
+                    let streams = send_state.inner.streams.lock().await;
+                    streams.get(&frame.stream_id).map(|s| s.lane_tunnel_id)
+                };
+                if let Err(e) = send_on_lane(
+                    &send_state.inner.lanes,
+                    &send_state.inner.rr,
+                    payload,
+                    lane_hint,
+                )
+                .await
+                {
                     log::warn!("smux client send failed: {}", e);
                 }
             }
@@ -219,7 +258,13 @@ impl SmuxClient {
             .streams
             .lock()
             .await
-            .insert(stream_id, ClientStream { app_tx });
+            .insert(
+                stream_id,
+                ClientStream {
+                    app_tx,
+                    lane_tunnel_id: 0,
+                },
+            );
         self.inner
             .pending_open
             .lock()
@@ -232,6 +277,24 @@ impl SmuxClient {
             self.inner.streams.lock().await.remove(&stream_id);
             self.inner.pending_open.lock().await.remove(&stream_id);
             return Err(e);
+        }
+
+        let lane_tunnel_id = {
+            let lanes = self.inner.lanes.lock().await;
+            if lanes.is_empty() {
+                self.inner.streams.lock().await.remove(&stream_id);
+                self.inner.pending_open.lock().await.remove(&stream_id);
+                return Err(anyhow!("no active tunnel lanes"));
+            }
+            let index = (stream_id as usize) % lanes.len();
+            lanes[index].tunnel_id
+        };
+
+        {
+            let mut streams = self.inner.streams.lock().await;
+            if let Some(s) = streams.get_mut(&stream_id) {
+                s.lane_tunnel_id = lane_tunnel_id;
+            }
         }
 
         let target = format!("{}:{}", target_host, target_port);
@@ -406,7 +469,12 @@ struct ServerInner {
     lanes: Mutex<Vec<Lane>>,
     rr: AtomicUsize,
     outgoing_tx: mpsc::Sender<Frame>,
-    streams: Mutex<HashMap<u32, mpsc::Sender<Bytes>>>,
+    streams: Mutex<HashMap<u32, ServerStream>>,
+}
+
+struct ServerStream {
+    to_tcp_tx: mpsc::Sender<Bytes>,
+    lane_tunnel_id: u32,
 }
 
 #[derive(Clone)]
@@ -431,7 +499,20 @@ impl SmuxServer {
         tokio::spawn(async move {
             while let Some(frame) = outgoing_rx.recv().await {
                 let payload = frame.encode();
-                if let Err(e) = send_on_lane(&send_state.inner.lanes, &send_state.inner.rr, payload).await {
+                let lane_hint = if frame.stream_id == 0 {
+                    None
+                } else {
+                    let streams = send_state.inner.streams.lock().await;
+                    streams.get(&frame.stream_id).map(|s| s.lane_tunnel_id)
+                };
+                if let Err(e) = send_on_lane(
+                    &send_state.inner.lanes,
+                    &send_state.inner.rr,
+                    payload,
+                    lane_hint,
+                )
+                .await
+                {
                     log::warn!("smux server send failed: {}", e);
                 }
             }
@@ -461,7 +542,7 @@ impl SmuxServer {
                 match decoder.feed(chunk) {
                     Ok(frames) => {
                         for frame in frames {
-                            if let Err(e) = this.handle_frame(frame).await {
+                            if let Err(e) = this.handle_frame(frame, tunnel_id).await {
                                 log::warn!("smux server frame error: {}", e);
                             }
                         }
@@ -493,14 +574,17 @@ impl SmuxServer {
         }
     }
 
-    async fn handle_frame(&self, frame: Frame) -> Result<()> {
+    async fn handle_frame(&self, frame: Frame, incoming_tunnel_id: u32) -> Result<()> {
         match frame.kind {
             FrameKind::Open => {
                 let target = String::from_utf8(frame.payload.to_vec())
                     .context("invalid stream OPEN target bytes")?;
                 let this = self.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = this.handle_open(frame.stream_id, target).await {
+                    if let Err(e) = this
+                        .handle_open(frame.stream_id, target, incoming_tunnel_id)
+                        .await
+                    {
                         let _ = this
                             .send_frame(Frame {
                                 kind: FrameKind::Reset,
@@ -515,7 +599,7 @@ impl SmuxServer {
             FrameKind::Data => {
                 let tx = {
                     let streams = self.inner.streams.lock().await;
-                    streams.get(&frame.stream_id).cloned()
+                    streams.get(&frame.stream_id).map(|s| s.to_tcp_tx.clone())
                 };
                 if let Some(tx) = tx {
                     if tx.send(frame.payload).await.is_err() {
@@ -530,14 +614,20 @@ impl SmuxServer {
         Ok(())
     }
 
-    async fn handle_open(&self, stream_id: u32, target: String) -> Result<()> {
+    async fn handle_open(&self, stream_id: u32, target: String, lane_tunnel_id: u32) -> Result<()> {
         let tcp = TcpStream::connect(&target)
             .await
             .with_context(|| format!("connect to {}", target))?;
         let (mut tcp_r, mut tcp_w) = tcp.into_split();
 
         let (to_tcp_tx, mut to_tcp_rx) = mpsc::channel::<Bytes>(2048);
-        self.inner.streams.lock().await.insert(stream_id, to_tcp_tx);
+        self.inner.streams.lock().await.insert(
+            stream_id,
+            ServerStream {
+                to_tcp_tx,
+                lane_tunnel_id,
+            },
+        );
 
         self.send_frame(Frame {
             kind: FrameKind::OpenAck,
