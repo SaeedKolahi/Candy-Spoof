@@ -5,7 +5,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -13,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::Config;
-use crate::tunnel::TunnelManager;
+use crate::smux::SmuxClient;
 
 // SOCKS5 constants
 const SOCKS_VER:          u8 = 0x05;
@@ -31,7 +30,7 @@ const REP_ATYP_UNSUPPORTED:u8 = 0x08;
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Bind and run the SOCKS5 proxy.  Never returns unless an error occurs.
-pub async fn run_socks5(cfg: Arc<Config>, manager: TunnelManager) -> Result<()> {
+pub async fn run_socks5(cfg: Arc<Config>, smux: SmuxClient) -> Result<()> {
     let bind = SocketAddr::from(([127, 0, 0, 1], cfg.socks5_port));
     let listener = TcpListener::bind(bind)
         .await
@@ -41,10 +40,10 @@ pub async fn run_socks5(cfg: Arc<Config>, manager: TunnelManager) -> Result<()> 
 
     loop {
         let (stream, peer) = listener.accept().await?;
-        let mgr  = manager.clone();
+        let smux2 = smux.clone();
         let cfg2 = cfg.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, mgr, cfg2).await {
+            if let Err(e) = handle_client(stream, smux2, cfg2).await {
                 log::debug!("SOCKS5 [{}]: {}", peer, e);
             }
         });
@@ -55,7 +54,7 @@ pub async fn run_socks5(cfg: Arc<Config>, manager: TunnelManager) -> Result<()> 
 
 async fn handle_client(
     mut stream: TcpStream,
-    manager:    TunnelManager,
+    smux:       SmuxClient,
     cfg:        Arc<Config>,
 ) -> Result<()> {
     // ── 1. Method negotiation ────────────────────────────────────────────────
@@ -93,22 +92,10 @@ async fn handle_client(
     log::info!("SOCKS5 CONNECT → {}:{}", target_host, target_port);
 
     // ── 3. Open tunnel and wait for handshake ────────────────────────────────
-    let (tunnel_id, mut app_rx, net_tx) = manager
-        .open_tunnel()
+    let (stream_id, mut app_rx, net_tx) = smux
+        .open_stream(target_host.clone(), target_port)
         .await
-        .context("open tunnel")?;
-
-    // Wait (without polling) for the tunnel to be established (SYN-ACK).
-    if !manager.wait_established(tunnel_id, Duration::from_secs(15)).await {
-        socks5_reply(&mut stream, REP_GENERAL_FAIL).await?;
-        bail!("tunnel {} handshake timed out", tunnel_id);
-    }
-
-    // Send CONNECT destination as the first payload so the server knows
-    // where to forward the TCP connection.
-    let connect_meta = format!("CONNECT {}:{}", target_host, target_port);
-    net_tx.send(Bytes::from(connect_meta)).await
-        .context("sending CONNECT meta")?;
+        .context("open smux stream")?;
 
     // Reply SOCKS5 success to the local application.
     socks5_reply(&mut stream, REP_SUCCESS).await?;
@@ -149,7 +136,7 @@ async fn handle_client(
         _ = t_to_a => {}
     }
 
-    manager.close_tunnel(tunnel_id).await;
+    smux.close_stream(stream_id).await;
     Ok(())
 }
 

@@ -15,9 +15,10 @@
 | Control channel | Spoofed ICMP Echo Request/Reply (looks like ping traffic) |
 | Reliable delivery | Selective Repeat ARQ with per-packet retransmission |
 | Congestion control | TCP-like AIMD: slow-start, congestion avoidance, fast retransmit, RTT estimation (RFC 6298) |
+| Stream multiplexing | SMUX-style framed multiplexing of many proxy streams over shared transport lanes |
 | SOCKS5 proxy | Local proxy on port 1080 – route any app through the tunnel |
 | Whitelist validation | Packets from unknown IPs are silently dropped |
-| Multiple tunnels | Configurable number of parallel independent tunnels |
+| Dynamic parallel tunnels | Runtime scales active lanes from 1 up to `tunnel_count` as concurrent streams increase |
 | Pre-shared key | Optional PSK for packet authentication |
 
 ## Prerequisites
@@ -79,7 +80,7 @@ After starting the client, configure your applications (browser, curl, etc.) to 
 | `allowed_peers` | both | Extra IPs to whitelist |
 | `interface` | both | Network interface (e.g. `eth0`) |
 | `socks5_port` | client | Local SOCKS5 proxy port (default `1080`) |
-| `tunnel_count` | both | Number of parallel tunnels (default `4`) |
+| `tunnel_count` | both | Max dynamic parallel lanes used by smux transport (default `4`) |
 | `mtu` | both | Max payload bytes per packet (default `1380`) |
 | `initial_cwnd` | both | Initial congestion window in packets (default `10`) |
 
@@ -131,7 +132,7 @@ Refer to `config/client.toml` and `config/server.toml` for complete configuratio
 
 ## Performance Tips
 
-- Increase `tunnel_count` for higher parallelism on fast links.
+- Increase `tunnel_count` to allow more dynamic parallel transport lanes on busy links.
 - Tune `mtu` to match path MTU (`tracepath` helps).
 - Raise `initial_cwnd` (e.g. `30`) on low-latency links to reduce slow-start
   ramp-up time.

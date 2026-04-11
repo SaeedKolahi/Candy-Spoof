@@ -38,7 +38,10 @@ pub struct Config {
     #[serde(default)]
     pub allowed_peers: Vec<Ipv4Addr>,
 
-    /// Number of independent parallel tunnels to maintain.
+    /// Maximum number of parallel smux transport tunnels.
+    ///
+    /// Runtime dynamically scales active lanes from 1 up to this value based
+    /// on concurrent stream count.
     #[serde(default = "default_tunnel_count")]
     pub tunnel_count: usize,
 
