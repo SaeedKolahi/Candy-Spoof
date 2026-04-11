@@ -3,19 +3,16 @@
 //! Accepts local TCP connections on `cfg.socks5_port`, performs the SOCKS5
 //! handshake, and relays data bidirectionally through a Candy-Spoof tunnel.
 
-use std::net::IpAddr;
 use std::net::SocketAddr;
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 
 use crate::config::Config;
-use crate::smux::SmuxClient;
 use crate::tunnel::TunnelManager;
 
 // SOCKS5 constants
@@ -40,47 +37,17 @@ pub async fn run_socks5(cfg: Arc<Config>, manager: TunnelManager) -> Result<()> 
         .await
         .with_context(|| format!("bind SOCKS5 port {}", cfg.socks5_port))?;
 
-    let sessions = Arc::new(SessionPool::new(cfg.clone(), manager));
-
     log::info!("SOCKS5 proxy listening on {}", bind);
 
     loop {
         let (stream, peer) = listener.accept().await?;
-        let sessions2 = sessions.clone();
+        let mgr  = manager.clone();
         let cfg2 = cfg.clone();
-        let user_ip = peer.ip();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, sessions2, cfg2, user_ip).await {
+            if let Err(e) = handle_client(stream, mgr, cfg2).await {
                 log::debug!("SOCKS5 [{}]: {}", peer, e);
             }
         });
-    }
-}
-
-struct SessionPool {
-    cfg: Arc<Config>,
-    manager: TunnelManager,
-    by_ip: Mutex<HashMap<IpAddr, SmuxClient>>,
-}
-
-impl SessionPool {
-    fn new(cfg: Arc<Config>, manager: TunnelManager) -> Self {
-        Self {
-            cfg,
-            manager,
-            by_ip: Mutex::new(HashMap::new()),
-        }
-    }
-
-    async fn get_or_create(&self, user_ip: IpAddr) -> Result<SmuxClient> {
-        if let Some(existing) = self.by_ip.lock().await.get(&user_ip).cloned() {
-            return Ok(existing);
-        }
-
-        let smux = SmuxClient::new(self.cfg.clone(), self.manager.clone()).await?;
-        let mut guard = self.by_ip.lock().await;
-        let entry = guard.entry(user_ip).or_insert_with(|| smux.clone());
-        Ok(entry.clone())
     }
 }
 
@@ -88,9 +55,8 @@ impl SessionPool {
 
 async fn handle_client(
     mut stream: TcpStream,
-    sessions:   Arc<SessionPool>,
+    manager:    TunnelManager,
     cfg:        Arc<Config>,
-    user_ip:    IpAddr,
 ) -> Result<()> {
     // ── 1. Method negotiation ────────────────────────────────────────────────
     let mut header = [0u8; 2];
@@ -123,20 +89,26 @@ async fn handle_client(
     }
 
     let (target_host, target_port) = read_target(&mut stream, atyp).await?;
-    let smux = sessions.get_or_create(user_ip).await?;
 
-    log::info!(
-        "SOCKS5 CONNECT [{}] → {}:{}",
-        user_ip,
-        target_host,
-        target_port
-    );
+    log::info!("SOCKS5 CONNECT → {}:{}", target_host, target_port);
 
     // ── 3. Open tunnel and wait for handshake ────────────────────────────────
-    let (stream_id, mut app_rx, net_tx) = smux
-        .open_stream(target_host.clone(), target_port)
+    let (tunnel_id, mut app_rx, net_tx) = manager
+        .open_tunnel()
         .await
-        .context("open smux stream")?;
+        .context("open tunnel")?;
+
+    // Wait (without polling) for the tunnel to be established (SYN-ACK).
+    if !manager.wait_established(tunnel_id, Duration::from_secs(15)).await {
+        socks5_reply(&mut stream, REP_GENERAL_FAIL).await?;
+        bail!("tunnel {} handshake timed out", tunnel_id);
+    }
+
+    // Send CONNECT destination as the first payload so the server knows
+    // where to forward the TCP connection.
+    let connect_meta = format!("CONNECT {}:{}", target_host, target_port);
+    net_tx.send(Bytes::from(connect_meta)).await
+        .context("sending CONNECT meta")?;
 
     // Reply SOCKS5 success to the local application.
     socks5_reply(&mut stream, REP_SUCCESS).await?;
@@ -177,7 +149,7 @@ async fn handle_client(
         _ = t_to_a => {}
     }
 
-    smux.close_stream(stream_id).await;
+    manager.close_tunnel(tunnel_id).await;
     Ok(())
 }
 

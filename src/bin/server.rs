@@ -9,12 +9,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use bytes::Bytes;
 use clap::Parser;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 use candy_spoof::config::Config;
 use candy_spoof::raw_socket::{RawReceiver, RawSender};
-use candy_spoof::smux::SmuxServer;
 use candy_spoof::tunnel::{PeerAddr, TunnelManager};
 
 #[derive(Parser, Debug)]
@@ -60,7 +62,6 @@ async fn main() -> Result<()> {
         is_server:   true,
     };
     let manager = TunnelManager::new(sender, peer_addr, cfg.clone());
-    let smux = SmuxServer::new(cfg.clone(), manager.clone()).await?;
 
     // ── Periodic housekeeping ────────────────────────────────────────────────
     let mgr_tick = manager.clone();
@@ -92,9 +93,10 @@ async fn main() -> Result<()> {
         {
             Ok(Some((syn_pkt, src_ip))) => {
                 // New tunnel request – accept it and spawn a session handler.
-                let smux2 = smux.clone();
+                let mgr2 = manager.clone();
+                let cfg2 = cfg.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = smux2.attach_syn(syn_pkt, src_ip).await {
+                    if let Err(e) = handle_new_tunnel(syn_pkt, src_ip, mgr2, cfg2).await {
                         log::warn!("session error: {}", e);
                     }
                 });
@@ -105,4 +107,95 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── New-tunnel handler ────────────────────────────────────────────────────────
+
+/// Accept a SYN, wait for the first DATA packet containing the CONNECT
+/// destination, open a TCP connection to that destination, and relay data.
+async fn handle_new_tunnel(
+    syn:     candy_spoof::packet::CandyPacket,
+    src_ip:  std::net::Ipv4Addr,
+    manager: TunnelManager,
+    cfg:     Arc<Config>,
+) -> Result<()> {
+    let (tunnel_id, mut app_rx, net_tx) = manager
+        .accept_syn(syn, src_ip)
+        .await
+        .context("accept_syn")?;
+
+    // First message from the client is the CONNECT destination.
+    let first_msg = tokio::time::timeout(Duration::from_secs(15), app_rx.recv())
+        .await
+        .context("timeout waiting for CONNECT meta")?
+        .context("tunnel closed before CONNECT meta")?;
+
+    let meta = String::from_utf8_lossy(&first_msg);
+    let (target_host, target_port) = parse_connect_meta(&meta)?;
+
+    log::info!(
+        "tunnel {} forwarding to {}:{}",
+        tunnel_id,
+        target_host,
+        target_port
+    );
+
+    // Open TCP connection to the target.
+    let target_addr = format!("{}:{}", target_host, target_port);
+    let tcp_stream = TcpStream::connect(&target_addr)
+        .await
+        .with_context(|| format!("connect to {}", target_addr))?;
+
+    let (mut tcp_r, mut tcp_w) = tcp_stream.into_split();
+    let mtu = cfg.mtu;
+
+    // Tunnel → TCP
+    let t_to_tcp = tokio::spawn(async move {
+        loop {
+            match app_rx.recv().await {
+                Some(data) => {
+                    if tcp_w.write_all(&data).await.is_err() { break; }
+                }
+                None => break,
+            }
+        }
+    });
+
+    // TCP → tunnel
+    let net_tx2 = net_tx;
+    let tcp_to_t = tokio::spawn(async move {
+        let mut buf = vec![0u8; mtu];
+        loop {
+            match tcp_r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = Bytes::copy_from_slice(&buf[..n]);
+                    if net_tx2.send(chunk).await.is_err() { break; }
+                }
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = t_to_tcp => {}
+        _ = tcp_to_t => {}
+    }
+
+    manager.close_tunnel(tunnel_id).await;
+    Ok(())
+}
+
+fn parse_connect_meta(meta: &str) -> Result<(String, u16)> {
+    // Expected format: "CONNECT host:port"
+    let rest = meta
+        .strip_prefix("CONNECT ")
+        .context("missing CONNECT prefix in meta")?;
+    let (host, port_str) = rest
+        .rsplit_once(':')
+        .context("missing ':' in CONNECT meta")?;
+    let port = port_str
+        .trim()
+        .parse::<u16>()
+        .context("invalid port in CONNECT meta")?;
+    Ok((host.to_string(), port))
 }
