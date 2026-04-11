@@ -13,8 +13,7 @@
 | Spoofed-IP pools | Rotate source addresses per session for better evasion |
 | Data channel | Spoofed UDP with configurable port |
 | Control channel | Spoofed ICMP Echo Request/Reply (looks like ping traffic) |
-| Reliable delivery | Selective Repeat ARQ with per-packet retransmission |
-| Congestion control | TCP-like AIMD: slow-start, congestion avoidance, fast retransmit, RTT estimation (RFC 6298) |
+| Transport mode | Best-effort low-latency forwarding (no ARQ / no congestion control) |
 | Stream multiplexing | SMUX-style framed multiplexing of many proxy streams over shared transport lanes |
 | SOCKS5 proxy | Local proxy on port 1080 – route any app through the tunnel |
 | Whitelist validation | Packets from unknown IPs are silently dropped |
@@ -82,7 +81,6 @@ After starting the client, configure your applications (browser, curl, etc.) to 
 | `socks5_port` | client | Local SOCKS5 proxy port (default `1080`) |
 | `tunnel_count` | both | Max dynamic parallel lanes used by smux transport (default `4`) |
 | `mtu` | both | Max payload bytes per packet (default `1380`) |
-| `initial_cwnd` | both | Initial congestion window in packets (default `10`) |
 
 **Note**: Both client and server configurations must match on critical fields like `data_port`, `icmp_id`, and `pre_shared_key` for the tunnel to work properly.
 
@@ -95,7 +93,7 @@ Refer to `config/client.toml` and `config/server.toml` for complete configuratio
      │  TCP (SOCKS5 CONNECT)
      ▼
 [SOCKS5 Proxy – 127.0.0.1:1080]
-     │  Candy-Spoof data (ARQ + CC)
+     │  Candy-Spoof data (best-effort)
      ▼
 [Raw UDP – src=spoofed_client_ip  dst=real_server_ip]
 ─── censored network ──────────────────────────────────
@@ -110,17 +108,12 @@ Refer to `config/client.toml` and `config/server.toml` for complete configuratio
 [Application receives response]
 ```
 
-**Control Channel**: Control packets (SYN, ACK, NACK, Heartbeat) use ICMP Echo Request/Reply messages to blend with ordinary ping traffic, making detection more difficult.
+**Control Channel**: Control packets (SYN, SYN-ACK, Heartbeat) use ICMP Echo Request/Reply messages to blend with ordinary ping traffic, making detection more difficult.
 
-## ARQ & Congestion Control
+## Transport Behavior
 
-- **Selective Repeat ARQ** – only missing packets retransmitted; out-of-order
-  packets buffered until gap is filled.
-- **Slow-start** – window grows exponentially from `initial_cwnd` until `ssthresh`.
-- **Congestion avoidance** – additive increase of ~+1 per RTT.
-- **Fast retransmit** – triggered on 3 duplicate ACKs; window halved.
-- **Timeout** – window reset to 1, exponential RTO back-off (up to 60 s).
-- **RTT estimation** – Jacobson/Karels algorithm (RFC 6298).
+- **Best-effort forwarding** – data frames are forwarded without ARQ retransmission or congestion-window gating.
+- **Low latency bias** – avoids ACK/NACK/timeout-based backpressure in the data path.
 
 ## Security Considerations
 
@@ -134,8 +127,6 @@ Refer to `config/client.toml` and `config/server.toml` for complete configuratio
 
 - Increase `tunnel_count` to allow more dynamic parallel transport lanes on busy links.
 - Tune `mtu` to match path MTU (`tracepath` helps).
-- Raise `initial_cwnd` (e.g. `30`) on low-latency links to reduce slow-start
-  ramp-up time.
 - Use a `spoofed_ip_pool` of 3–5 addresses to distribute traffic patterns.
 
 ## License

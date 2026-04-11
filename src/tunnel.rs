@@ -1,10 +1,10 @@
 //! Tunnel state machine and manager.
 //!
 //! A [`Tunnel`] represents a single logical bidirectional stream between client
-//! and server.  It owns an [`SrArq`] instance.
+//! and server.
 //!
 //! [`TunnelManager`] multiplexes/demultiplexes packets across all active tunnels
-//! (keyed by `tunnel_id`), drives ARQ, and provides the async interface used
+//! (keyed by `tunnel_id`) and provides the async interface used
 //! by both the client (SOCKS5) and server (TCP proxy) code.
 
 use std::collections::HashMap;
@@ -16,7 +16,6 @@ use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use tokio::sync::{mpsc, Mutex, Notify};
 
-use crate::arq::SrArq;
 use crate::config::Config;
 use crate::packet::{CandyPacket, PacketKind};
 use crate::raw_socket::{OutPacket, RawSender};
@@ -36,12 +35,10 @@ pub enum TunnelState {
 struct Tunnel {
     id:          u32,
     state:       TunnelState,
-    arq:         SrArq,
+    send_seq:    u32,
     /// Deliver received application data to the owner of this tunnel.
     app_tx:      mpsc::Sender<Bytes>,
     last_active: Instant,
-    /// Notified whenever the send window opens (ACK received / window update).
-    window_notify: Arc<Notify>,
     /// Notified when the tunnel transitions to Established.
     established_notify: Arc<Notify>,
 }
@@ -51,16 +48,14 @@ impl Tunnel {
         id:           u32,
         state:        TunnelState,
         init_seq:     u32,
-        init_recv:    u32,
         app_tx:       mpsc::Sender<Bytes>,
     ) -> Self {
         Self {
             id,
             state,
-            arq:         SrArq::new(init_seq, init_recv),
+            send_seq:    init_seq,
             app_tx,
             last_active: Instant::now(),
-            window_notify:      Arc::new(Notify::new()),
             established_notify: Arc::new(Notify::new()),
         }
     }
@@ -75,20 +70,15 @@ impl Tunnel {
         if self.state != TunnelState::SynSent {
             return false;
         }
-        // Peer SYN consumes one sequence number, so peer DATA starts at seq+1.
-        self.arq.set_recv_base(syn_ack.seq.wrapping_add(1));
-        self.arq.set_send_window(syn_ack.window as u32);
+        let _ = syn_ack;
         self.state = TunnelState::Established;
         true
     }
 
     fn make_data_packet(&mut self, payload: Bytes) -> CandyPacket {
-        const UNASSIGNED_SEQ: u32 = u32::MAX;
-        let ack    = self.arq.recv_base();
-        let window = (64u32.saturating_sub(self.arq.in_flight())) as u16;
-        let mut pkt = CandyPacket::new_data(self.id, UNASSIGNED_SEQ, ack, window, payload);
-        let _seq = self.arq.enqueue(&mut pkt); // assigns sequence and buffers retransmit copy
-        pkt
+        let seq = self.send_seq;
+        self.send_seq = self.send_seq.wrapping_add(1);
+        CandyPacket::new_data(self.id, seq, 0, 0, payload)
     }
 }
 
@@ -154,16 +144,14 @@ impl TunnelManager {
             id,
             TunnelState::SynSent,
             syn_seq.wrapping_add(1),  // SYN consumes syn_seq, first DATA is syn_seq+1
-            0,
             app_tx,
         );
         // Grab the notifiers before inserting (to avoid re-locking).
-        let window_notify      = tunnel.window_notify.clone();
         let established_notify = tunnel.established_notify.clone();
         self.0.tunnels.lock().await.insert(id, tunnel);
 
         // Spawn a task that forwards application data to the raw socket.
-        self.spawn_send_task(id, net_rx, window_notify);
+        self.spawn_send_task(id, net_rx);
 
         // Send the initial SYN on the control channel.
         let syn = CandyPacket::new_syn(id, syn_seq);
@@ -198,15 +186,13 @@ impl TunnelManager {
             id,
             TunnelState::SynReceived,
             our_seq.wrapping_add(1), // SYN-ACK consumes our_seq; first DATA must be seq+1
-            syn.seq.wrapping_add(1),
             app_tx,
         );
         // Server transitions to Established immediately after SYN-ACK.
         tunnel.state = TunnelState::Established;
-        let window_notify = tunnel.window_notify.clone();
         self.0.tunnels.lock().await.insert(id, tunnel);
 
-        self.spawn_send_task(id, net_rx, window_notify);
+        self.spawn_send_task(id, net_rx);
 
         let syn_ack = CandyPacket::new_syn_ack(id, syn.seq, our_seq);
         self.tx_control(syn_ack).await?;
@@ -262,49 +248,23 @@ impl TunnelManager {
             PacketKind::SynAck => {
                 if t.apply_syn_ack(&pkt) {
                     log::info!("tunnel {} established", pkt.tunnel_id);
-                    let tid    = t.id;
                     let notify = t.established_notify.clone();
-                    let wnotify = t.window_notify.clone();
-                    let ack = CandyPacket::new_ack(tid, pkt.seq.wrapping_add(1), 64);
                     drop(tunnels);
                     // Wake any task waiting for establishment.
                     notify.notify_waiters();
-                    // Window may now be available.
-                    wnotify.notify_waiters();
-                    self.tx_control(ack).await?;
                 }
             }
 
             PacketKind::Ack => {
-                let _acked = t.arq.process_ack(pkt.ack);
-                t.arq.set_send_window(pkt.window as u32);
-                // Notify the send task that window space may have opened.
-                t.window_notify.notify_one();
+                let _ = pkt;
             }
 
             PacketKind::Nack => {
-                if let Some(retransmit) = t.arq.process_nack(pkt.seq) {
-                    drop(tunnels);
-                    self.tx_data(retransmit).await?;
-                    return Ok(None);
-                }
+                let _ = pkt;
             }
 
             PacketKind::Data => {
-                let tid = t.id;
-                let (deliverable, ack_num, nacks) = t.arq.receive(pkt.clone());
-
-                for payload in deliverable {
-                    let _ = t.app_tx.try_send(payload);
-                }
-
-                let window = (64u32.saturating_sub(t.arq.in_flight())) as u16;
-                drop(tunnels);
-
-                self.tx_control(CandyPacket::new_ack(tid, ack_num, window)).await?;
-                for missing in nacks {
-                    self.tx_control(CandyPacket::new_nack(tid, missing)).await?;
-                }
+                let _ = t.app_tx.try_send(pkt.payload);
             }
 
             PacketKind::Fin => {
@@ -336,11 +296,10 @@ impl TunnelManager {
 
     // ── Periodic tick ─────────────────────────────────────────────────────────
 
-    /// Drive retransmissions and send heartbeats.  Call every ~100 ms.
+    /// Send heartbeats and clean up closed tunnels.  Call every ~100 ms.
     pub async fn tick(&self) -> Result<()> {
-        let (expired_pkts, heartbeats, _to_remove): (Vec<_>, Vec<_>, Vec<_>) = {
+        let (heartbeats, _to_remove): (Vec<_>, Vec<_>) = {
             let mut tunnels = self.0.tunnels.lock().await;
-            let mut exp  = Vec::new();
             let mut hbs  = Vec::new();
             let mut dead = Vec::new();
 
@@ -349,19 +308,14 @@ impl TunnelManager {
                     dead.push(*id);
                     continue;
                 }
-                let timed_out = t.arq.take_timed_out();
-                if !timed_out.is_empty() {
-                    exp.extend(timed_out);
-                }
                 if t.state == TunnelState::Established && t.is_idle(Duration::from_secs(5)) {
                     hbs.push(CandyPacket::new_heartbeat(t.id, rand::random()));
                 }
             }
             for id in &dead { tunnels.remove(id); }
-            (exp, hbs, dead)
+            (hbs, dead)
         };
 
-        for pkt in expired_pkts { self.tx_data(pkt).await?; }
         for hb  in heartbeats   { self.tx_control(hb).await?; }
         Ok(())
     }
@@ -410,7 +364,6 @@ impl TunnelManager {
         &self,
         tunnel_id:     u32,
         mut net_rx:    mpsc::Receiver<Bytes>,
-        _window_notify: Arc<Notify>,
     ) {
         let this = self.clone();
         let mtu  = self.0.cfg.mtu;
@@ -476,29 +429,28 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn client_syn_ack_updates_recv_base_to_peer_seq_plus_one() {
-        const PEER_SEQ: u32 = 777;
+    async fn client_syn_ack_marks_established() {
         let (app_tx, _app_rx) = mpsc::channel::<Bytes>(1);
-        let mut tunnel = Tunnel::new(1, TunnelState::SynSent, 100, 0, app_tx);
-        let syn_ack = CandyPacket::new_syn_ack(1, 99, PEER_SEQ);
+        let mut tunnel = Tunnel::new(1, TunnelState::SynSent, 100, app_tx);
+        let syn_ack = CandyPacket::new_syn_ack(1, 99, 777);
 
-        assert_eq!(tunnel.arq.recv_base(), 0);
+        assert_eq!(tunnel.state, TunnelState::SynSent);
         assert!(tunnel.apply_syn_ack(&syn_ack));
-        assert_eq!(tunnel.arq.recv_base(), PEER_SEQ + 1);
+        assert_eq!(tunnel.state, TunnelState::Established);
     }
 
     #[tokio::test]
-    async fn make_data_packet_uses_arq_assigned_seq() {
+    async fn make_data_packet_uses_monotonic_seq() {
         let (app_tx, _app_rx) = mpsc::channel::<Bytes>(1);
-        let mut tunnel = Tunnel::new(42, TunnelState::Established, 1000, 7, app_tx);
+        let mut tunnel = Tunnel::new(42, TunnelState::Established, 1000, app_tx);
 
         let p1 = tunnel.make_data_packet(Bytes::from_static(b"a"));
         let p2 = tunnel.make_data_packet(Bytes::from_static(b"b"));
 
         assert_eq!(p1.seq, 1000);
         assert_eq!(p2.seq, 1001);
-        assert_eq!(p1.ack, 7);
-        assert_eq!(p2.ack, 7);
+        assert_eq!(p1.ack, 0);
+        assert_eq!(p2.ack, 0);
     }
 
     #[tokio::test]
@@ -512,7 +464,6 @@ mod tests {
             TID,
             TunnelState::Established,
             OUR_SYN_ACK_SEQ.wrapping_add(1),
-            PEER_SEQ.wrapping_add(1),
             app_tx,
         );
         let syn_ack = CandyPacket::new_syn_ack(TID, PEER_SEQ, OUR_SYN_ACK_SEQ);

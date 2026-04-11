@@ -59,16 +59,11 @@ pub struct Config {
     /// Maximum payload size per tunnel packet (bytes, default 1380).
     #[serde(default = "default_mtu")]
     pub mtu: usize,
-
-    /// Initial congestion window in packets.
-    #[serde(default = "default_cwnd")]
-    pub initial_cwnd: f64,
 }
 
 fn default_tunnel_count() -> usize { 4 }
 fn default_socks5_port() -> u16 { 1080 }
 fn default_mtu() -> usize { 1380 }
-fn default_cwnd() -> f64 { 10.0 }
 
 impl Config {
     /// Load configuration from a TOML file.
