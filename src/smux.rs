@@ -186,7 +186,6 @@ struct ClientInner {
     manager: TunnelManager,
     lanes: Mutex<Vec<Lane>>,
     rr: AtomicUsize,
-    outgoing_tx: mpsc::Sender<Frame>,
     streams: Mutex<HashMap<u32, ClientStream>>,
     pending_open: Mutex<HashMap<u32, oneshot::Sender<Result<()>>>>,
     next_stream_id: AtomicU32,
@@ -199,45 +198,17 @@ pub struct SmuxClient {
 
 impl SmuxClient {
     pub async fn new(cfg: Arc<Config>, manager: TunnelManager) -> Result<Self> {
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Frame>(4096);
-
         let inner = Arc::new(ClientInner {
             cfg,
             manager,
             lanes: Mutex::new(Vec::new()),
             rr: AtomicUsize::new(0),
-            outgoing_tx,
             streams: Mutex::new(HashMap::new()),
             pending_open: Mutex::new(HashMap::new()),
             next_stream_id: AtomicU32::new(1),
         });
 
-        let this = Self { inner };
-
-        let send_state = this.clone();
-        tokio::spawn(async move {
-            while let Some(frame) = outgoing_rx.recv().await {
-                let payload = frame.encode();
-                let lane_hint = if frame.stream_id == 0 {
-                    None
-                } else {
-                    let streams = send_state.inner.streams.lock().await;
-                    streams.get(&frame.stream_id).map(|s| s.lane_tunnel_id)
-                };
-                if let Err(e) = send_on_lane(
-                    &send_state.inner.lanes,
-                    &send_state.inner.rr,
-                    payload,
-                    lane_hint,
-                )
-                .await
-                {
-                    log::warn!("smux client send failed: {}", e);
-                }
-            }
-        });
-
-        Ok(this)
+        Ok(Self { inner })
     }
 
     pub async fn open_stream(
@@ -353,23 +324,42 @@ impl SmuxClient {
     }
 
     pub async fn close_stream(&self, stream_id: u32) {
-        self.inner.streams.lock().await.remove(&stream_id);
+        let lane_hint = {
+            let streams = self.inner.streams.lock().await;
+            streams.get(&stream_id).map(|s| s.lane_tunnel_id)
+        };
         self.inner.pending_open.lock().await.remove(&stream_id);
         let _ = self
-            .send_frame(Frame {
-                kind: FrameKind::Close,
-                stream_id,
-                payload: Bytes::new(),
-            })
+            .send_frame_with_hint(
+                Frame {
+                    kind: FrameKind::Close,
+                    stream_id,
+                    payload: Bytes::new(),
+                },
+                lane_hint,
+            )
             .await;
+        self.inner.streams.lock().await.remove(&stream_id);
     }
 
     async fn send_frame(&self, frame: Frame) -> Result<()> {
-        self.inner
-            .outgoing_tx
-            .send(frame)
-            .await
-            .map_err(|_| anyhow!("smux outgoing channel closed"))
+        let lane_hint = if frame.stream_id == 0 {
+            None
+        } else {
+            let streams = self.inner.streams.lock().await;
+            streams.get(&frame.stream_id).map(|s| s.lane_tunnel_id)
+        };
+        self.send_frame_with_hint(frame, lane_hint).await
+    }
+
+    async fn send_frame_with_hint(&self, frame: Frame, lane_hint: Option<u32>) -> Result<()> {
+        send_on_lane(
+            &self.inner.lanes,
+            &self.inner.rr,
+            frame.encode(),
+            lane_hint,
+        )
+        .await
     }
 
     async fn ensure_lane_count(&self, desired: usize) -> Result<()> {
@@ -468,7 +458,6 @@ struct ServerInner {
     manager: TunnelManager,
     lanes: Mutex<Vec<Lane>>,
     rr: AtomicUsize,
-    outgoing_tx: mpsc::Sender<Frame>,
     streams: Mutex<HashMap<u32, ServerStream>>,
 }
 
@@ -484,41 +473,15 @@ pub struct SmuxServer {
 
 impl SmuxServer {
     pub async fn new(cfg: Arc<Config>, manager: TunnelManager) -> Result<Self> {
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Frame>(4096);
         let inner = Arc::new(ServerInner {
             cfg,
             manager,
             lanes: Mutex::new(Vec::new()),
             rr: AtomicUsize::new(0),
-            outgoing_tx,
             streams: Mutex::new(HashMap::new()),
         });
 
-        let this = Self { inner };
-        let send_state = this.clone();
-        tokio::spawn(async move {
-            while let Some(frame) = outgoing_rx.recv().await {
-                let payload = frame.encode();
-                let lane_hint = if frame.stream_id == 0 {
-                    None
-                } else {
-                    let streams = send_state.inner.streams.lock().await;
-                    streams.get(&frame.stream_id).map(|s| s.lane_tunnel_id)
-                };
-                if let Err(e) = send_on_lane(
-                    &send_state.inner.lanes,
-                    &send_state.inner.rr,
-                    payload,
-                    lane_hint,
-                )
-                .await
-                {
-                    log::warn!("smux server send failed: {}", e);
-                }
-            }
-        });
-
-        Ok(this)
+        Ok(Self { inner })
     }
 
     pub async fn attach_syn(&self, syn: CandyPacket, src_ip: Ipv4Addr) -> Result<()> {
@@ -560,11 +523,23 @@ impl SmuxServer {
     }
 
     async fn send_frame(&self, frame: Frame) -> Result<()> {
-        self.inner
-            .outgoing_tx
-            .send(frame)
-            .await
-            .map_err(|_| anyhow!("smux server outgoing channel closed"))
+        let lane_hint = if frame.stream_id == 0 {
+            None
+        } else {
+            let streams = self.inner.streams.lock().await;
+            streams.get(&frame.stream_id).map(|s| s.lane_tunnel_id)
+        };
+        self.send_frame_with_hint(frame, lane_hint).await
+    }
+
+    async fn send_frame_with_hint(&self, frame: Frame, lane_hint: Option<u32>) -> Result<()> {
+        send_on_lane(
+            &self.inner.lanes,
+            &self.inner.rr,
+            frame.encode(),
+            lane_hint,
+        )
+        .await
     }
 
     async fn remove_lane(&self, tunnel_id: u32) {
@@ -586,11 +561,14 @@ impl SmuxServer {
                         .await
                     {
                         let _ = this
-                            .send_frame(Frame {
-                                kind: FrameKind::Reset,
-                                stream_id: frame.stream_id,
-                                payload: Bytes::from(e.to_string()),
-                            })
+                            .send_frame_with_hint(
+                                Frame {
+                                    kind: FrameKind::Reset,
+                                    stream_id: frame.stream_id,
+                                    payload: Bytes::from(e.to_string()),
+                                },
+                                Some(incoming_tunnel_id),
+                            )
                             .await;
                     }
                 });
