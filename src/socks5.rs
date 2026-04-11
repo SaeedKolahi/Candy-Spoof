@@ -3,8 +3,8 @@
 //! Accepts local TCP connections on `cfg.socks5_port`, performs the SOCKS5
 //! handshake, and relays data bidirectionally through a Candy-Spoof tunnel.
 
+use std::net::IpAddr;
 use std::net::SocketAddr;
-use std::net::{IpAddr, Ipv4Addr};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -48,8 +48,9 @@ pub async fn run_socks5(cfg: Arc<Config>, manager: TunnelManager) -> Result<()> 
         let (stream, peer) = listener.accept().await?;
         let sessions2 = sessions.clone();
         let cfg2 = cfg.clone();
+        let user_ip = peer.ip();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, sessions2, cfg2).await {
+            if let Err(e) = handle_client(stream, sessions2, cfg2, user_ip).await {
                 log::debug!("SOCKS5 [{}]: {}", peer, e);
             }
         });
@@ -59,7 +60,7 @@ pub async fn run_socks5(cfg: Arc<Config>, manager: TunnelManager) -> Result<()> 
 struct SessionPool {
     cfg: Arc<Config>,
     manager: TunnelManager,
-    by_ip: Mutex<HashMap<Ipv4Addr, SmuxClient>>,
+    by_ip: Mutex<HashMap<IpAddr, SmuxClient>>,
 }
 
 impl SessionPool {
@@ -71,17 +72,15 @@ impl SessionPool {
         }
     }
 
-    async fn get_or_create(&self, target_host: &str) -> Result<(Ipv4Addr, SmuxClient)> {
-        let ip = resolve_ipv4(target_host).await?;
-
-        if let Some(existing) = self.by_ip.lock().await.get(&ip).cloned() {
-            return Ok((ip, existing));
+    async fn get_or_create(&self, user_ip: IpAddr) -> Result<SmuxClient> {
+        if let Some(existing) = self.by_ip.lock().await.get(&user_ip).cloned() {
+            return Ok(existing);
         }
 
         let smux = SmuxClient::new(self.cfg.clone(), self.manager.clone()).await?;
         let mut guard = self.by_ip.lock().await;
-        let entry = guard.entry(ip).or_insert_with(|| smux.clone());
-        Ok((ip, entry.clone()))
+        let entry = guard.entry(user_ip).or_insert_with(|| smux.clone());
+        Ok(entry.clone())
     }
 }
 
@@ -91,6 +90,7 @@ async fn handle_client(
     mut stream: TcpStream,
     sessions:   Arc<SessionPool>,
     cfg:        Arc<Config>,
+    user_ip:    IpAddr,
 ) -> Result<()> {
     // ── 1. Method negotiation ────────────────────────────────────────────────
     let mut header = [0u8; 2];
@@ -123,13 +123,13 @@ async fn handle_client(
     }
 
     let (target_host, target_port) = read_target(&mut stream, atyp).await?;
-    let (target_ip, smux) = sessions.get_or_create(&target_host).await?;
+    let smux = sessions.get_or_create(user_ip).await?;
 
     log::info!(
-        "SOCKS5 CONNECT → {}:{} (session ip {})",
+        "SOCKS5 CONNECT [{}] → {}:{}",
+        user_ip,
         target_host,
-        target_port,
-        target_ip
+        target_port
     );
 
     // ── 3. Open tunnel and wait for handshake ────────────────────────────────
@@ -179,28 +179,6 @@ async fn handle_client(
 
     smux.close_stream(stream_id).await;
     Ok(())
-}
-
-async fn resolve_ipv4(host: &str) -> Result<Ipv4Addr> {
-    if let Ok(ip) = host.parse::<Ipv4Addr>() {
-        return Ok(ip);
-    }
-
-    if let Ok(IpAddr::V4(ip)) = host.parse::<IpAddr>() {
-        return Ok(ip);
-    }
-
-    let addrs = tokio::net::lookup_host((host, 0))
-        .await
-        .with_context(|| format!("DNS resolve {}", host))?;
-
-    for addr in addrs {
-        if let IpAddr::V4(ip) = addr.ip() {
-            return Ok(ip);
-        }
-    }
-
-    bail!("host {} has no IPv4 address", host)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
