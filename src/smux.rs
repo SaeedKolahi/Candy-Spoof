@@ -215,10 +215,7 @@ impl SmuxClient {
         target_host: String,
         target_port: u16,
     ) -> Result<(u32, mpsc::Receiver<Bytes>, mpsc::Sender<Bytes>)> {
-        let stream_id = self
-            
-            
-            NEXT_STREAM_ID
+        let stream_id = NEXT_STREAM_ID
             .fetch_add(1, Ordering::Relaxed)
             .max(1);
 
