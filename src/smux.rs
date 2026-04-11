@@ -198,7 +198,6 @@ impl SmuxClient {
             }
         });
 
-        this.ensure_lane_count(1).await?;
         Ok(this)
     }
 
@@ -229,7 +228,11 @@ impl SmuxClient {
 
         let active_streams = self.inner.streams.lock().await.len().max(1);
         let desired_lanes = active_streams.min(self.inner.cfg.tunnel_count.max(1));
-        self.ensure_lane_count(desired_lanes).await?;
+        if let Err(e) = self.ensure_lane_count(desired_lanes).await {
+            self.inner.streams.lock().await.remove(&stream_id);
+            self.inner.pending_open.lock().await.remove(&stream_id);
+            return Err(e);
+        }
 
         let target = format!("{}:{}", target_host, target_port);
         self.send_frame(Frame {
