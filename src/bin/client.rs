@@ -14,7 +14,6 @@ use clap::Parser;
 
 use candy_spoof::config::Config;
 use candy_spoof::raw_socket::{RawReceiver, RawSender};
-use candy_spoof::smux::SmuxClient;
 use candy_spoof::socks5::run_socks5;
 use candy_spoof::tunnel::{PeerAddr, TunnelManager};
 
@@ -68,7 +67,6 @@ async fn main() -> Result<()> {
         is_server:   false,
     };
     let manager = TunnelManager::new(sender, peer_addr, cfg.clone());
-    let smux = SmuxClient::new(cfg.clone(), manager.clone()).await?;
 
     // ── Background task: process incoming packets ─────────────────────────────
     let mgr2 = manager.clone();
@@ -100,7 +98,7 @@ async fn main() -> Result<()> {
     });
 
     // ── Foreground: SOCKS5 proxy ──────────────────────────────────────────────
-    run_socks5(cfg, smux).await?;
+    run_socks5(cfg, manager).await?;
 
     Ok(())
 }

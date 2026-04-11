@@ -18,6 +18,7 @@ const SMUX_MAGIC: u32 = 0x53_4d_55_58;
 const SMUX_VERSION: u8 = 1;
 const SMUX_HEADER_LEN: usize = 14;
 const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
+static NEXT_STREAM_ID: AtomicU32 = AtomicU32::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -188,7 +189,6 @@ struct ClientInner {
     rr: AtomicUsize,
     streams: Mutex<HashMap<u32, ClientStream>>,
     pending_open: Mutex<HashMap<u32, oneshot::Sender<Result<()>>>>,
-    next_stream_id: AtomicU32,
 }
 
 #[derive(Clone)]
@@ -205,7 +205,6 @@ impl SmuxClient {
             rr: AtomicUsize::new(0),
             streams: Mutex::new(HashMap::new()),
             pending_open: Mutex::new(HashMap::new()),
-            next_stream_id: AtomicU32::new(1),
         });
 
         Ok(Self { inner })
@@ -217,8 +216,9 @@ impl SmuxClient {
         target_port: u16,
     ) -> Result<(u32, mpsc::Receiver<Bytes>, mpsc::Sender<Bytes>)> {
         let stream_id = self
-            .inner
-            .next_stream_id
+            
+            
+            NEXT_STREAM_ID
             .fetch_add(1, Ordering::Relaxed)
             .max(1);
 

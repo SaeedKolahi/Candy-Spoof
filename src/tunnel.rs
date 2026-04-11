@@ -444,15 +444,12 @@ impl TunnelManager {
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     /// Spawn a background task that drains `net_rx` and sends each chunk as a
-    /// data packet through the tunnel, respecting the congestion window.
-    ///
-    /// Uses `window_notify` to sleep until the window has room (instead of
-    /// polling), avoiding unnecessary CPU usage.
+    /// data packet through the tunnel without waiting on a congestion window.
     fn spawn_send_task(
         &self,
         tunnel_id:     u32,
         mut net_rx:    mpsc::Receiver<Bytes>,
-        window_notify: Arc<Notify>,
+        _window_notify: Arc<Notify>,
     ) {
         let this = self.clone();
         let mtu  = self.0.cfg.mtu;
@@ -463,21 +460,6 @@ impl TunnelManager {
                 while offset < data.len() {
                     let end   = (offset + mtu).min(data.len());
                     let chunk = data.slice(offset..end);
-
-                    // Wait until the congestion/ARQ window has room.
-                    // `Notify::notified()` is consumed by one waiter so this
-                    // is race-free: if the window opens between the `can_send`
-                    // check and the await, the notification is stored and we
-                    // wake immediately.
-                    loop {
-                        let can = {
-                            let tunnels = this.0.tunnels.lock().await;
-                            tunnels.get(&tunnel_id).map(|t| t.can_send()).unwrap_or(false)
-                        };
-                        if can { break; }
-                        // Block until an ACK arrives and opens the window.
-                        window_notify.notified().await;
-                    }
 
                     if let Err(e) = this.enqueue_and_send(tunnel_id, chunk).await {
                         log::debug!("send task tunnel {}: {}", tunnel_id, e);
