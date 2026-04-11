@@ -460,7 +460,11 @@ impl TunnelManager {
         let Some(tunnel) = self.0.tunnels.get(&id).map(|t| t.clone()) else {
             return false;
         };
-        tunnel.lock().await.state == TunnelState::Established
+        let established = {
+            let guard = tunnel.lock().await;
+            guard.state == TunnelState::Established
+        };
+        established
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
