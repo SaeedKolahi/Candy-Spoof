@@ -80,23 +80,31 @@ impl FrameDecoder {
                 break;
             }
 
-            let mut header = &self.buf[..SMUX_HEADER_LEN];
-            let magic = header.get_u32();
+            let magic = u32::from_be_bytes(self.buf[0..4].try_into().unwrap_or([0u8; 4]));
             if magic != SMUX_MAGIC {
-                bail!("invalid smux magic 0x{:08x}", magic);
+                self.buf.advance(1);
+                continue;
             }
 
-            let version = header.get_u8();
+            let version = self.buf[4];
             if version != SMUX_VERSION {
-                bail!("unsupported smux version {}", version);
+                self.buf.advance(1);
+                continue;
             }
 
-            let kind = FrameKind::try_from(header.get_u8())?;
-            let stream_id = header.get_u32();
-            let payload_len = header.get_u32() as usize;
+            let kind = match FrameKind::try_from(self.buf[5]) {
+                Ok(k) => k,
+                Err(_) => {
+                    self.buf.advance(1);
+                    continue;
+                }
+            };
+            let stream_id = u32::from_be_bytes(self.buf[6..10].try_into().unwrap_or([0u8; 4]));
+            let payload_len = u32::from_be_bytes(self.buf[10..14].try_into().unwrap_or([0u8; 4])) as usize;
 
             if payload_len > MAX_FRAME_PAYLOAD {
-                bail!("smux payload too large: {}", payload_len);
+                self.buf.advance(1);
+                continue;
             }
 
             let full_len = SMUX_HEADER_LEN + payload_len;
@@ -116,6 +124,12 @@ impl FrameDecoder {
 
         Ok(out)
     }
+}
+
+fn max_smux_payload_for_mtu(mtu: usize) -> usize {
+    mtu.saturating_sub(SMUX_HEADER_LEN)
+        .max(1)
+        .min(MAX_FRAME_PAYLOAD)
 }
 
 #[derive(Clone)]
@@ -266,6 +280,16 @@ impl SmuxClient {
         }
 
         let target = format!("{}:{}", target_host, target_port);
+        let max_payload = self.max_frame_payload();
+        if target.len() > max_payload {
+            self.inner.streams.lock().await.remove(&stream_id);
+            self.inner.pending_open.lock().await.remove(&stream_id);
+            return Err(anyhow!(
+                "target descriptor too large for mtu ({} > {})",
+                target.len(),
+                max_payload
+            ));
+        }
         self.send_frame(Frame {
             kind: FrameKind::Open,
             stream_id,
@@ -293,17 +317,23 @@ impl SmuxClient {
         let (to_mux_tx, mut to_mux_rx) = mpsc::channel::<Bytes>(2048);
         let this = self.clone();
         tokio::spawn(async move {
+            let max_payload = this.max_frame_payload();
             while let Some(chunk) = to_mux_rx.recv().await {
-                if this
-                    .send_frame(Frame {
-                        kind: FrameKind::Data,
-                        stream_id,
-                        payload: chunk,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
+                let mut offset = 0;
+                while offset < chunk.len() {
+                    let end = (offset + max_payload).min(chunk.len());
+                    if this
+                        .send_frame(Frame {
+                            kind: FrameKind::Data,
+                            stream_id,
+                            payload: chunk.slice(offset..end),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    offset = end;
                 }
             }
 
@@ -350,6 +380,11 @@ impl SmuxClient {
     }
 
     async fn send_frame_with_hint(&self, frame: Frame, lane_hint: Option<u32>) -> Result<()> {
+        let mut frame = frame;
+        let max_payload = self.max_frame_payload();
+        if frame.payload.len() > max_payload {
+            frame.payload = frame.payload.slice(..max_payload);
+        }
         send_on_lane(
             &self.inner.lanes,
             &self.inner.rr,
@@ -357,6 +392,10 @@ impl SmuxClient {
             lane_hint,
         )
         .await
+    }
+
+    fn max_frame_payload(&self) -> usize {
+        max_smux_payload_for_mtu(self.inner.cfg.mtu)
     }
 
     async fn ensure_lane_count(&self, desired: usize) -> Result<()> {
@@ -530,6 +569,11 @@ impl SmuxServer {
     }
 
     async fn send_frame_with_hint(&self, frame: Frame, lane_hint: Option<u32>) -> Result<()> {
+        let mut frame = frame;
+        let max_payload = self.max_frame_payload();
+        if frame.payload.len() > max_payload {
+            frame.payload = frame.payload.slice(..max_payload);
+        }
         send_on_lane(
             &self.inner.lanes,
             &self.inner.rr,
@@ -537,6 +581,10 @@ impl SmuxServer {
             lane_hint,
         )
         .await
+    }
+
+    fn max_frame_payload(&self) -> usize {
+        max_smux_payload_for_mtu(self.inner.cfg.mtu)
     }
 
     async fn remove_lane(&self, tunnel_id: u32) {
@@ -621,22 +669,28 @@ impl SmuxServer {
 
         let this = self.clone();
         let mtu = self.inner.cfg.mtu;
+        let max_payload = self.max_frame_payload();
         let reader = tokio::spawn(async move {
             let mut buf = vec![0u8; mtu.max(512)];
             loop {
                 match tcp_r.read(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => {
-                        if this
-                            .send_frame(Frame {
-                                kind: FrameKind::Data,
-                                stream_id,
-                                payload: Bytes::copy_from_slice(&buf[..n]),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
+                        let mut offset = 0;
+                        while offset < n {
+                            let end = (offset + max_payload).min(n);
+                            if this
+                                .send_frame(Frame {
+                                    kind: FrameKind::Data,
+                                    stream_id,
+                                    payload: Bytes::copy_from_slice(&buf[offset..end]),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            offset = end;
                         }
                     }
                     Err(_) => break,
