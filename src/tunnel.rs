@@ -536,12 +536,20 @@ impl TunnelManager {
     async fn tx_control(&self, pkt: CandyPacket) -> Result<()> {
         let a   = &self.0.addr;
         let enc = pkt.encode();
-        let out = OutPacket::Icmp {
-            src_ip:  a.local_spoof,
-            dst_ip:  a.peer_real,
-            id:      a.icmp_id,
-            seq:     (pkt.seq & 0xffff) as u16,
-            payload: enc,
+        let out = if self.0.cfg.spoof_outbound {
+            OutPacket::Icmp {
+                src_ip:  a.local_spoof,
+                dst_ip:  a.peer_real,
+                id:      a.icmp_id,
+                seq:     (pkt.seq & 0xffff) as u16,
+                payload: enc,
+            }
+        } else {
+            OutPacket::UdpStd {
+                dst_ip:   a.peer_real,
+                dst_port: a.data_port,
+                payload:  enc,
+            }
         };
         self.0.sender.send(out).await
     }
@@ -549,12 +557,20 @@ impl TunnelManager {
     async fn tx_data(&self, pkt: CandyPacket) -> Result<()> {
         let a   = &self.0.addr;
         let enc = pkt.encode();
-        let out = OutPacket::Udp {
-            src_ip:   a.local_spoof,
-            dst_ip:   a.peer_real,
-            src_port: a.data_port,
-            dst_port: a.data_port,
-            payload:  enc,
+        let out = if self.0.cfg.spoof_outbound {
+            OutPacket::Udp {
+                src_ip:   a.local_spoof,
+                dst_ip:   a.peer_real,
+                src_port: a.data_port,
+                dst_port: a.data_port,
+                payload:  enc,
+            }
+        } else {
+            OutPacket::UdpStd {
+                dst_ip:   a.peer_real,
+                dst_port: a.data_port,
+                payload:  enc,
+            }
         };
         self.0.sender.send(out).await
     }

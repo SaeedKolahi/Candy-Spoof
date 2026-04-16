@@ -12,6 +12,7 @@ peer_real_ip   = "10.0.0.1"
 # The spoofed source IP the server uses in outgoing replies.
 spoofed_ip     = "1.2.3.4"
 
+
 # Spoofed IP pool – server can rotate among multiple addresses.
 spoofed_ip_pool = ["1.2.3.4", "5.6.7.8"]
 

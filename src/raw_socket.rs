@@ -13,6 +13,7 @@
 //! with the Tokio task graph through `tokio::sync::mpsc` channels.
 
 use std::net::Ipv4Addr;
+use std::net::UdpSocket;
 use std::os::unix::io::RawFd;
 
 use anyhow::{Context, Result};
@@ -66,6 +67,12 @@ pub enum OutPacket {
         seq:     u16,
         payload: Bytes,
     },
+    /// Send a UDP payload using a normal UDP socket (non-spoofed, kernel-picked src).
+    UdpStd {
+        dst_ip:   Ipv4Addr,
+        dst_port: u16,
+        payload:  Bytes,
+    },
 }
 
 /// A received packet that has been validated and parsed.
@@ -90,6 +97,7 @@ impl RawSender {
     /// Spawn the background sender thread and return a `RawSender` handle.
     pub fn spawn() -> Result<Self> {
         let fd = create_raw_send_socket()?;
+        let udp_sock = UdpSocket::bind("0.0.0.0:0").context("bind udp socket")?;
         let (tx, mut rx) = mpsc::channel::<OutPacket>(4096);
 
         // Dedicated blocking sender thread. This avoids expensive per-packet
@@ -98,7 +106,7 @@ impl RawSender {
             .name("raw-send".into())
             .spawn(move || {
                 while let Some(out) = rx.blocking_recv() {
-                    if let Err(e) = send_out_packet(fd, out) {
+                    if let Err(e) = send_out_packet(fd, &udp_sock, out) {
                         log::warn!("raw-send error: {}", e);
                     }
                 }
@@ -204,7 +212,7 @@ fn create_raw_recv_socket(proto: libc::c_int) -> Result<RawFd> {
 
 // ── Packet transmission ───────────────────────────────────────────────────────
 
-fn send_out_packet(fd: RawFd, out: OutPacket) -> Result<()> {
+fn send_out_packet(fd: RawFd, udp_sock: &UdpSocket, out: OutPacket) -> Result<()> {
     match out {
         OutPacket::Udp { src_ip, dst_ip, src_port, dst_port, payload } => {
             let raw = build_udp_packet(src_ip, dst_ip, src_port, dst_port, &payload);
@@ -217,6 +225,12 @@ fn send_out_packet(fd: RawFd, out: OutPacket) -> Result<()> {
         OutPacket::IcmpReply { src_ip, dst_ip, id, seq, payload } => {
             let raw = build_icmp_echo(src_ip, dst_ip, id, seq, &payload, true);
             raw_sendto(fd, &raw, dst_ip)
+        }
+        OutPacket::UdpStd { dst_ip, dst_port, payload } => {
+            udp_sock
+                .send_to(&payload, (dst_ip, dst_port))
+                .context("udp send_to failed")?;
+            Ok(())
         }
     }
 }

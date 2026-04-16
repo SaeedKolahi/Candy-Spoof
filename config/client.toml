@@ -14,6 +14,7 @@ peer_real_ip   = "203.0.113.1"
 # Choose a routable, innocent-looking address.
 spoofed_ip     = "8.8.4.4"
 
+
 # Spoofed IP pool – one will be chosen at random per session for better
 # evasion.  Includes spoofed_ip so it is always a valid choice.
 spoofed_ip_pool = ["8.8.4.4", "1.1.1.1", "208.67.222.222"]

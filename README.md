@@ -82,10 +82,25 @@ After starting the client, configure your applications (browser, curl, etc.) to 
 | `tunnel_count` | both | Number of parallel tunnels (default `4`) |
 | `mtu` | both | Max payload bytes per packet (default `1380`) |
 | `initial_cwnd` | both | Initial congestion window in packets (default `10`) |
+| `spoof_outbound` | both | If `false`, send outbound packets with the real source IP instead of spoofing |
 
 **Note**: Both client and server configurations must match on critical fields like `data_port`, `icmp_id`, and `pre_shared_key` for the tunnel to work properly.
 
 Refer to `config/client.toml` and `config/server.toml` for complete configuration examples.
+
+### Asymmetric / Xray-backed mode
+
+For deployments where one side cannot spoof outbound packets directly and must
+use a normal-IP backchannel such as Xray/VLESS, use the interactive installer:
+
+```bash
+chmod +x deploy/asym/setup-interactive.sh
+sudo ./deploy/asym/setup-interactive.sh
+```
+
+The installer prompts for the required values, explains each prompt, and sets
+`spoof_outbound = false` only for the Xray-backed side. The main repository
+defaults remain unchanged.
 
 ## How It Works
 

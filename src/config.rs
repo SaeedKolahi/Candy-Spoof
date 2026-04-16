@@ -21,6 +21,12 @@ pub struct Config {
     /// The spoofed source IP the peer uses (expected in incoming packets).
     pub peer_spoofed_ip: Ipv4Addr,
 
+    /// If false, outbound packets are sent with the real source IP (kernel-chosen),
+    /// instead of spoofing `spoofed_ip`. Useful for asymmetric deployments where
+    /// only one side can spoof and the other must use a backchannel.
+    #[serde(default)]
+    pub spoof_outbound: bool,
+
     /// Optional pool of spoofed IPs for rotation.  If empty, `spoofed_ip` is
     /// always used.
     #[serde(default)]
@@ -66,7 +72,6 @@ fn default_tunnel_count() -> usize { 4 }
 fn default_socks5_port() -> u16 { 1080 }
 fn default_mtu() -> usize { 1380 }
 fn default_cwnd() -> f64 { 10.0 }
-
 impl Config {
     /// Load configuration from a TOML file.
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
@@ -94,5 +99,15 @@ impl Config {
             .spoofed_ip_pool
             .choose(&mut rand::thread_rng())
             .unwrap_or(&self.spoofed_ip)
+    }
+
+    /// Pick the source IP to use for outbound traffic, depending on
+    /// `spoof_outbound`.
+    pub fn pick_source_ip(&self) -> Ipv4Addr {
+        if !self.spoof_outbound {
+            self.real_ip
+        } else {
+            self.pick_spoofed_ip()
+        }
     }
 }
